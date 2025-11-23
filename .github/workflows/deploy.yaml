@@ -60,6 +60,7 @@ jobs:
             db_user='django_user' \
             db_password='SuperSecret123!' \
             secret_key='django-insecure-key-123'
+            echo 'Vault configured successfully'
         "
         # Создаем Kubernetes secret
         kubectl create secret generic django-secrets \
@@ -74,5 +75,5 @@ jobs:
         # Ждем запуска и делаем миграции
         kubectl rollout status deployment/deployment -n ${{ env.K8S_NAMESPACE }} --timeout=300s
         kubectl exec deployment/deployment -n ${{ env.K8S_NAMESPACE }} -- python manage.py migrate
-        echo "🚀 Deployment completed!"
+        echo "Deployment completed!"
         kubectl get pods,svc -n ${{ env.K8S_NAMESPACE }}
