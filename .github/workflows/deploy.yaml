@@ -1,0 +1,78 @@
+name: Deploy Django App to Kubernetes
+
+on:
+  push:
+    branches: [ main ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/django-full-app
+  K8S_NAMESPACE: django-app
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+    - uses: actions/checkout@v4
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: |
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Kubeconfig
+      uses: azure/k8s-set-context@v3
+      with:
+        kubeconfig: ${{ secrets.KUBE_CONFIG }}
+    - name: Deploy to Kubernetes
+      run: |
+        # Создаем namespace
+        kubectl create namespace ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+        # Запускаем инфраструктуру
+        kubectl apply -f k8s-manifests/namespace.yaml
+        kubectl apply -f k8s-manifests/vault.yaml
+        kubectl apply -f k8s-manifests/postgres.yaml
+        # Ждем Vault
+        sleep 30
+        # Настраиваем Vault
+        kubectl exec deployment/vault -n ${{ env.K8S_NAMESPACE }} -- /bin/sh -c "
+          export VAULT_ADDR='http://127.0.0.1:8200'
+          export VAULT_TOKEN='root'
+          vault secrets enable -path=secret kv-v2 || true
+          vault kv put secret/django-app/database \
+            db_user='django_user' \
+            db_password='SuperSecret123!' \
+            secret_key='django-insecure-key-123'
+        "
+        # Создаем Kubernetes secret
+        kubectl create secret generic django-secrets \
+          --from-literal=db_user='django_user' \
+          --from-literal=db_password='SuperSecret123!' \
+          --from-literal=secret_key='django-insecure-key-123' \
+          -n ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+        # Деплоим приложение с новым образом
+        kubectl apply -f k8s-manifests/deployment.yaml -n ${{ env.K8S_NAMESPACE }}
+        kubectl apply -f k8s-manifests/service.yaml -n ${{ env.K8S_NAMESPACE }}
+        kubectl apply -f k8s-manifests/ingress.yaml -n ${{ env.K8S_NAMESPACE }}
+        # Ждем запуска и делаем миграции
+        kubectl rollout status deployment/deployment -n ${{ env.K8S_NAMESPACE }} --timeout=300s
+        kubectl exec deployment/deployment -n ${{ env.K8S_NAMESPACE }} -- python manage.py migrate
+        echo "🚀 Deployment completed!"
+        kubectl get pods,svc -n ${{ env.K8S_NAMESPACE }}

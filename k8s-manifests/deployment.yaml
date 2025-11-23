@@ -21,7 +21,7 @@ spec:
     spec:
       containers:
       - name: django-app
-        image: your-username/django-full-app:latest
+        image: ghcr.io/${{ github.repository_owner }}/django-full-app:latest
         ports:
         - containerPort: 8000
         env:
