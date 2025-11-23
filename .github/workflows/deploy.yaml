@@ -1,58 +1,59 @@
-name: Deploy Django App to Kubernetes
+name: CI Pipeline - Build and Test
 
 on:
   push:
     branches: [ main ]
+  pull_request:
+    branches: [ main ]
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: dmitrylebovski/django-full-app
-  K8S_NAMESPACE: django-app
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build-and-push:
+  test-and-build:
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
     - uses: actions/checkout@v4
-    - name: Log in to Container Registry
-      uses: docker/login-action@v3
+    - name: Set up Python
+      uses: actions/setup-python@v4
       with:
-        registry: ${{ env.REGISTRY }}
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-    - name: Build and push Docker image
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        push: true
-        tags: |
-          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-
-  deploy:
-    needs: build-and-push
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v4
-    - name: Set up Kubeconfig
-      uses: azure/k8s-set-context@v3
-      with:
-        kubeconfig: ${{ secrets.KUBE_CONFIG }}
-    - name: Deploy to Kubernetes
+        python-version: '3.11'
+    - name: Install dependencies and test
       run: |
-        # Создаем namespace
-        kubectl create namespace ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
-        # Запускаем инфраструктуру
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        python manage.py check
+        python manage.py makemigrations --check --dry-run
+        echo "Django application is healthy"
+    - name: Build and push Docker image
+      run: |
+        echo ${{ secrets.GITHUB_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+        # Build and tag the image
+        docker build -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest .
+        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+        echo "Docker image pushed successfully!"
+        echo "Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+    - name: Create deployment script
+      run: |
+        cat > deploylocal.sh << 'EOF'
+        #!/bin/bash
+        echo "Deploying to local Minikube cluster..."
+        eval $(minikube docker-env)
+        docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+        # Deploy infrastructure
         kubectl apply -f k8s-manifests/namespace.yaml
         kubectl apply -f k8s-manifests/vault.yaml
         kubectl apply -f k8s-manifests/postgres.yaml
-        # Ждем Vault
-        sleep 30
-        # Настраиваем Vault
-        kubectl exec deployment/vault -n ${{ env.K8S_NAMESPACE }} -- /bin/sh -c "
+        # Wait for Vault
+        echo "Waiting for Vault to be ready..."
+        kubectl wait --for=condition=ready pod -l app=vault -n django-app --timeout=180s
+        # Configure Vault
+        echo "Configuring Vault..."
+        kubectl exec deployment/vault -n django-app -- /bin/sh -c "
           export VAULT_ADDR='http://127.0.0.1:8200'
           export VAULT_TOKEN='root'
           vault secrets enable -path=secret kv-v2 || true
@@ -60,20 +61,36 @@ jobs:
             db_user='django_user' \
             db_password='SuperSecret123!' \
             secret_key='django-insecure-key-123'
-            echo 'Vault configured successfully'
+          echo 'Vault configured'
         "
-        # Создаем Kubernetes secret
+        # Create Kubernetes secrets
         kubectl create secret generic django-secrets \
           --from-literal=db_user='django_user' \
           --from-literal=db_password='SuperSecret123!' \
           --from-literal=secret_key='django-insecure-key-123' \
-          -n ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
-        # Деплоим приложение с новым образом
-        kubectl apply -f k8s-manifests/deployment.yaml -n ${{ env.K8S_NAMESPACE }}
-        kubectl apply -f k8s-manifests/service.yaml -n ${{ env.K8S_NAMESPACE }}
-        kubectl apply -f k8s-manifests/ingress.yaml -n ${{ env.K8S_NAMESPACE }}
-        # Ждем запуска и делаем миграции
-        kubectl rollout status deployment/deployment -n ${{ env.K8S_NAMESPACE }} --timeout=300s
-        kubectl exec deployment/deployment -n ${{ env.K8S_NAMESPACE }} -- python manage.py migrate
+          -n django-app --dry-run=client -o yaml | kubectl apply -f -
+        # Deploy Django application
+        kubectl apply -f k8s-manifests/django-deployment.yaml -n django-app
+        kubectl apply -f k8s-manifests/django-service.yaml -n django-app
+        kubectl apply -f k8s-manifests/ingress.yaml -n django-app
+        # Wait for deployment
+        echo "Waiting for Django deployment..."
+        kubectl rollout status deployment/django-deployment -n django-app --timeout=300s
+        echo "Running database migrations..."
+        kubectl exec deployment/django-deployment -n django-app -- python manage.py migrate
         echo "Deployment completed!"
-        kubectl get pods,svc -n ${{ env.K8S_NAMESPACE }}
+        echo "minikube service django-service -n django-app --url"
+        EOF
+        echo "Deployment script created: deploylocal.sh"
+
+    - name: Show deployment instructions
+      run: |
+        echo "SUCCESS"
+        echo "   eval \$(minikube docker-env)"
+        echo "   docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+        echo "   kubectl apply -f k8s-manifests/ -n django-app"
+        echo ""
+        echo "   chmod +x deploylocal.sh"
+        echo "   ./deploylocal.sh"
+        echo ""
+        echo "   for i in {1..5}; do curl -s \$(minikube service django-service -n django-app --url) | grep hostname; done"
