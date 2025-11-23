@@ -6,7 +6,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/django-full-app
+  IMAGE_NAME: dmitrylebovski/django-full-app
   K8S_NAMESPACE: django-app
 
 jobs:
